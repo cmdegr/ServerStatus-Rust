@@ -18,8 +18,8 @@ use tokio::time;
 use stat_common::server_status::{IpInfo, StatRequest, SysInfo};
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;
+mod geoip;
 mod grpc;
-mod ip_api;
 mod status;
 mod sys_info;
 mod vnstat;
@@ -90,6 +90,13 @@ pub struct Args {
     sys_info: bool,
     #[arg(long = "ip-info", help = "show ip info, default:false")]
     ip_info: bool,
+    #[arg(
+        long = "ip-source",
+        env = "SSR_IP_SOURCE",
+        default_value = "ip-api.com",
+        help = "ip info source"
+    )]
+    ip_source: String,
     #[arg(long = "json", help = "use json protocol, default:false")]
     json: bool,
     #[arg(short = '6', long = "ipv6", help = "ipv6 only, default:false")]
@@ -136,6 +143,10 @@ pub struct Args {
         help = "exclude iface"
     )]
     exclude_iface: Vec<String>,
+    #[arg(long, env = "SSR_PROXY", default_value = "", help = "proxy")]
+    proxy: String,
+    #[arg(long, env = "SSR_NO_PROXY", default_value = "", help = "no proxy, eg: ip-api.com")]
+    no_proxy: String,
 }
 
 impl Args {
@@ -196,11 +207,21 @@ fn http_report(args: &Args, stat_base: &mut StatRequest) -> Result<()> {
         stat_base.online6 = ipv6;
     }
 
-    let http_client = reqwest::Client::builder()
+    let mut http_client_builder = reqwest::Client::builder()
         .pool_max_idle_per_host(1)
         .connect_timeout(Duration::from_secs(5))
-        .user_agent(format!("{}/{}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .user_agent(format!("{}/{}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")));
+
+    if !args.proxy.is_empty() {
+        let mut proxy = reqwest::Proxy::all(&args.proxy)?;
+        if !args.no_proxy.is_empty() {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&args.no_proxy));
+        }
+
+        http_client_builder = http_client_builder.proxy(proxy);
+    }
+
+    let http_client = http_client_builder.build()?;
     loop {
         let stat_rt = sample_all(args, stat_base);
 
@@ -262,7 +283,7 @@ async fn refresh_ip_info(args: &Args) {
     let mut interval = time::interval(time::Duration::from_secs(3600));
     loop {
         info!("get ip info from ip-api.com");
-        match ip_api::get_ip_info(args.ipv6).await {
+        match geoip::get_ip_info(args).await {
             Ok(ip_info) => {
                 info!("refresh_ip_info succ => {:?}", ip_info);
                 if let Ok(mut o) = G_CONFIG.lock() {
@@ -289,7 +310,7 @@ async fn main() -> Result<()> {
     }
 
     if args.ip_info {
-        let info = ip_api::get_ip_info(args.ipv6).await?;
+        let info = geoip::get_ip_info(&args).await?;
         dbg!(info);
         process::exit(0);
     }
